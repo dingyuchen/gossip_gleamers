@@ -1,6 +1,6 @@
 # gossip_gleamers
 
-My attempt at [Gossip Gleamers](https://fly.io/dist-sys/)
+My attempt at [Gossip Glomers](https://fly.io/dist-sys/)
 
 ## Run
 
