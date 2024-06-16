@@ -1,9 +1,17 @@
 {
   "name": "Devcontainer",
+  // "build": {
+  //   "dockerfile": "Dockerfile"
+  // },
   "image": "ghcr.io/gleam-lang/gleam:v1.2.1-erlang",
   "customizations": {
     "vscode": {
       "extensions": ["Gleam.gleam"]
     }
-  }
+  },
+  "features": {
+    "ghcr.io/meaningful-ooo/devcontainer-features/fish:1": {},
+    "ghcr.io/devcontainers/features/java:1": {}
+  },
+  "postCreateCommand": "apt update && apt install -y gnuplot graphviz"
 }

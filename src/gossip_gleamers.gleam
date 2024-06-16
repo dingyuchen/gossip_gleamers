@@ -3,6 +3,7 @@ import gleam/erlang
 import gleam/int
 import gleam/io
 import gleam/json
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
@@ -21,19 +22,22 @@ fn msg_from_json(json_string: String) {
   json.decode(from: json_string, using: msg_decoder)
 }
 
-type Body {
+type Request {
   InitReq(msg_id: Int, node_id: String, node_ids: List(String))
   EchoReq(msg_id: Int, content: String)
+  IdReq(msg_id: Int)
 }
 
 type Response {
   InitRsp(in_reply_to: Int)
-  ErrorMsg(in_reply_to: Int, code: Int, text: String)
   EchoRsp(msg_id: Int, in_reply_to: Int, content: String)
+  IdRsp(in_reply_to: Int, id: Int)
+  ErrorMsg(in_reply_to: Int, code: Int, text: String)
 }
 
 fn body_from_json(dict: dynamic.Dynamic) {
   use t <- result.try(field(named: "type", of: string)(dict))
+  io.debug(t)
   case t {
     "init" -> {
       // {"type":"init","node_id":"n0","node_ids":["n0"],"msg_id":1}
@@ -60,12 +64,16 @@ fn body_from_json(dict: dynamic.Dynamic) {
         )
       echo_decoder(dict)
     }
-    _ -> panic as "unknown message type"
+    "generate" -> {
+      // {
+      //   "type": "generate",
+      //   "msg_id": 1
+      // }
+      let id_decoder = dynamic.decode1(IdReq, field(named: "msg_id", of: int))
+      id_decoder(dict)
+    }
+    t -> panic as { "unknown message type " <> t }
   }
-}
-
-type State {
-  State(node_id: Int)
 }
 
 fn msg_to_json(msg: Maelstrom(Response)) {
@@ -92,6 +100,13 @@ fn body_to_json(body: Response) {
         #("text", json.string(text)),
       ])
     }
+    IdRsp(in_reply_to, id) -> {
+      json.object([
+        #("type", json.string("generate_ok")),
+        #("in_reply_to", json.int(in_reply_to)),
+        #("id", json.int(id)),
+      ])
+    }
     EchoRsp(msg_id, in_reply_to, content) -> {
       json.object([
         #("type", json.string("echo_ok")),
@@ -103,21 +118,62 @@ fn body_to_json(body: Response) {
   }
 }
 
+type State {
+  State(node_id: Option(Int), sequence_no: Int, ots: Int)
+}
+
 fn loop(state: State) {
   let input = result.unwrap(erlang.get_line(""), "")
   use msg <- result.try(msg_from_json(input))
   // io.debug(msg)
+  let #(_, s, us) = erlang.erlang_timestamp()
+  let ms = s * 1000 + us / 1000
   let #(state, reply) = case msg {
     Message(a, b, InitReq(msg_id, node_id, _node_ids)) -> {
       // io.println_error("InitReq")
-      let node_id = string.drop_right(node_id, 1)
+      let node_id = string.drop_left(node_id, 1)
+      io.debug(node_id)
       let id = result.unwrap(int.parse(node_id), -1)
-      #(State(id), Message(b, a, InitRsp(msg_id)))
+      #(State(Some(id), state.sequence_no, ms), Message(b, a, InitRsp(msg_id)))
     }
     Message(a, b, EchoReq(msg_id, content)) -> {
       // io.println_error("EchoReq")
       // io.println_error(content)
-      #(state, Message(b, a, EchoRsp(msg_id, 1, content)))
+      #(
+        State(state.node_id, state.sequence_no, ms),
+        Message(b, a, EchoRsp(msg_id, 1, content)),
+      )
+    }
+    Message(a, b, IdReq(msg_id)) -> {
+      // | timestamp | node id | sequence no. |
+      // | 17        | 6       | 8            |
+      // total 31
+      let State(node_id, sequence_no, ts) = state
+      case node_id {
+        None -> {
+          let error_msg = Message(b, a, ErrorMsg(msg_id, 1, "node id not set"))
+          #(state, error_msg)
+        }
+        Some(id) -> {
+          let sequence_no = case ts >= ms {
+            True -> sequence_no
+            False -> 0
+          }
+          io.debug(#(ts, ms, sequence_no))
+          let ms = int.max(ts, ms)
+          let uid =
+            ms
+            |> int.bitwise_and(0x1FFFF)
+            |> int.bitwise_shift_left(6)
+            |> int.bitwise_or(id)
+            |> int.bitwise_shift_left(8)
+            |> int.bitwise_or(sequence_no)
+          #(
+            State(state.node_id, sequence_no + 1, ms),
+            Message(b, a, IdRsp(msg_id, uid)),
+          )
+        }
+      }
     }
   }
   // io.debug(reply)
@@ -128,5 +184,7 @@ fn loop(state: State) {
 }
 
 pub fn main() {
-  loop(State(-1))
+  let #(_, s, us) = erlang.erlang_timestamp()
+  let ms = s * 1000 + us / 1000
+  loop(State(None, 0, ms))
 }
