@@ -4,6 +4,7 @@ import gleam/erlang
 import gleam/int
 import gleam/io
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set.{type Set}
@@ -24,21 +25,18 @@ fn msg_from_json(json_string: String) {
   json.decode(from: json_string, using: msg_decoder)
 }
 
-type Request {
+type Body {
   InitReq(msg_id: Int, node_id: String, node_ids: List(String))
   EchoReq(msg_id: Int, content: String)
   IdReq(msg_id: Int)
-  BroadcastReq(msg_id: Int, message: Int)
+  BroadcastReq(msg_id: Option(Int), message: Int)
   ReadReq(msg_id: Int)
   TopologyReq(msg_id: Int, topology: Dict(String, List(String)))
-}
-
-type Response {
   InitRsp(in_reply_to: Int)
   EchoRsp(msg_id: Int, in_reply_to: Int, content: String)
   IdRsp(in_reply_to: Int, id: Int)
   ErrorMsg(in_reply_to: Int, code: Int, text: String)
-  BroadcastRsp(in_reply_to: Int)
+  BroadcastRsp(in_reply_to: Option(Int))
   TopologyRsp(in_reply_to: Int)
   ReadRsp(in_reply_to: Int, messages: List(Int))
 }
@@ -88,8 +86,8 @@ fn body_from_json(dict: dynamic.Dynamic) {
       let msg_decoder =
         dynamic.decode2(
           BroadcastReq,
+          dynamic.optional_field(named: "msg_id", of: int),
           field(named: "message", of: int),
-          field(named: "msg_id", of: int),
         )
       msg_decoder(dict)
     }
@@ -113,11 +111,19 @@ fn body_from_json(dict: dynamic.Dynamic) {
         dynamic.decode1(ReadReq, field(named: "msg_id", of: int))
       read_decoder(dict)
     }
+    "broadcast_ok" -> {
+      let decoder =
+        dynamic.decode1(
+          BroadcastRsp,
+          dynamic.optional_field(named: "in_reply_to", of: int),
+        )
+      decoder(dict)
+    }
     t -> panic as { "unknown message type " <> t }
   }
 }
 
-fn msg_to_json(msg: Maelstrom(Response)) {
+fn msg_to_json(msg: Maelstrom(Body)) {
   json.object([
     #("src", json.string(msg.src)),
     #("dest", json.string(msg.dest)),
@@ -125,7 +131,7 @@ fn msg_to_json(msg: Maelstrom(Response)) {
   ])
 }
 
-fn body_to_json(body: Response) {
+fn body_to_json(body: Body) {
   case body {
     InitRsp(in_reply_to) -> {
       json.object([
@@ -156,11 +162,14 @@ fn body_to_json(body: Response) {
         #("echo", json.string(content)),
       ])
     }
-    BroadcastRsp(in_reply_to) -> {
+    BroadcastRsp(Some(in_reply_to)) -> {
       json.object([
         #("type", json.string("broadcast_ok")),
         #("in_reply_to", json.int(in_reply_to)),
       ])
+    }
+    BroadcastRsp(None) -> {
+      json.object([#("type", json.string("broadcast_ok"))])
     }
     TopologyRsp(in_reply_to) -> {
       json.object([
@@ -175,38 +184,56 @@ fn body_to_json(body: Response) {
         #("messages", json.array(from: messages, of: json.int)),
       ])
     }
+    BroadcastReq(Some(msg_id), message) -> {
+      json.object([
+        #("type", json.string("broadcast")),
+        #("msg_id", json.int(msg_id)),
+        #("message", json.int(message)),
+      ])
+    }
+    BroadcastReq(None, message) -> {
+      json.object([
+        #("type", json.string("broadcast")),
+        #("message", json.int(message)),
+      ])
+    }
+    t -> panic as { string.inspect(t) <> " serialization not implemented" }
   }
 }
 
 type State {
-  State(node_id: Option(Int), sequence_no: Int, ots: Int, values: Set(Int))
+  State(
+    node_id: Option(Int),
+    node_total: Int,
+    sequence_no: Int,
+    ots: Int,
+    values: Set(Int),
+    topology: Dict(String, List(String)),
+  )
 }
 
 fn loop(state: State) {
   let input = result.unwrap(erlang.get_line(""), "")
+  // io.debug(input)
   use msg <- result.try(msg_from_json(input))
   // io.debug(msg)
   let #(_, s, us) = erlang.erlang_timestamp()
   let ms = s * 1000 + us / 1000
-  let State(node_id, sequence_no, ts, values) = state
-  let #(state, reply) = case msg {
-    Message(a, b, InitReq(msg_id, node_id, _node_ids)) -> {
+  let State(node_id, _node_total, sequence_no, ts, values, topology) = state
+  let #(state, replies) = case msg {
+    Message(a, b, InitReq(msg_id, node_id, node_ids)) -> {
       // io.println_error("InitReq")
       let node_id = string.drop_left(node_id, 1)
       // io.debug(node_id)
       let id = result.unwrap(int.parse(node_id), -1)
-      #(
-        State(Some(id), state.sequence_no, ms, values),
+      #(State(..state, node_id: Some(id), node_total: list.length(node_ids)), [
         Message(b, a, InitRsp(msg_id)),
-      )
+      ])
     }
     Message(a, b, EchoReq(msg_id, content)) -> {
       // io.println_error("EchoReq")
       // io.println_error(content)
-      #(
-        State(state.node_id, state.sequence_no, ms, values),
-        Message(b, a, EchoRsp(msg_id, 1, content)),
-      )
+      #(state, [Message(b, a, EchoRsp(msg_id, 1, content))])
     }
     Message(a, b, IdReq(msg_id)) -> {
       // | timestamp | node id | sequence no. |
@@ -215,7 +242,7 @@ fn loop(state: State) {
       case node_id {
         None -> {
           let error_msg = Message(b, a, ErrorMsg(msg_id, 1, "node id not set"))
-          #(state, error_msg)
+          #(state, [error_msg])
         }
         Some(id) -> {
           let sequence_no = case ts >= ms {
@@ -231,36 +258,53 @@ fn loop(state: State) {
             |> int.bitwise_or(id)
             |> int.bitwise_shift_left(8)
             |> int.bitwise_or(sequence_no)
-          #(
-            State(state.node_id, sequence_no + 1, ms, values),
+          #(State(..state, sequence_no: sequence_no + 1), [
             Message(b, a, IdRsp(msg_id, uid)),
-          )
+          ])
         }
       }
     }
     Message(a, b, BroadcastReq(msg_id, value)) -> {
-      let new_values = values |> set.insert(value)
-      #(
-        State(node_id, sequence_no, ts, new_values),
-        Message(b, a, BroadcastRsp(msg_id)),
-      )
+      case set.contains(values, value) {
+        False -> {
+          let new_values = values |> set.insert(value)
+          let neighbors = result.unwrap(dict.get(topology, b), [])
+          let msgs =
+            neighbors
+            |> list.map(fn(n) { Message(b, n, BroadcastReq(None, value)) })
+          #(State(..state, values: new_values), [
+            Message(b, a, BroadcastRsp(msg_id)),
+            ..msgs
+          ])
+        }
+        True -> {
+          #(state, [Message(b, a, BroadcastRsp(msg_id))])
+        }
+      }
     }
-    Message(a, b, TopologyReq(msg_id, _topology)) -> {
-      #(state, Message(b, a, TopologyRsp(msg_id)))
+    Message(a, b, TopologyReq(msg_id, topology)) -> {
+      #(State(..state, topology: topology), [Message(b, a, TopologyRsp(msg_id))])
     }
     Message(a, b, ReadReq(msg_id)) -> {
-      #(state, Message(b, a, ReadRsp(msg_id, values |> set.to_list)))
+      #(state, [Message(b, a, ReadRsp(msg_id, values |> set.to_list))])
     }
+    Message(_, _, BroadcastRsp(_)) -> {
+      #(state, [])
+    }
+    t -> panic as { string.inspect(t) <> " handler not implemented" }
   }
-  // io.debug(reply)
-  msg_to_json(reply)
-  |> json.to_string
-  |> io.println
+
+  let send = fn(reply) {
+    msg_to_json(reply)
+    |> json.to_string
+    |> io.println
+  }
+  replies |> list.map(send)
   loop(state)
 }
 
 pub fn main() {
   let #(_, s, us) = erlang.erlang_timestamp()
   let ms = s * 1000 + us / 1000
-  loop(State(None, 0, ms, set.new()))
+  loop(State(None, 0, 0, ms, set.new(), dict.new()))
 }
